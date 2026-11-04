@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+#
+# sysupdate — update the whole system in one command.
+#
+# Runs, in order:
+#   1. pacman -Syu            (official repos)
+#   2. yay -Syu               (AUR packages; re-checks repos, usually a no-op there)
+#   3. flatpak update         (user + system installations)
+#
+# Then reports orphaned packages and .pacnew files, like sysclean does.
+#
+# Run it as your normal user. It asks for sudo itself when it needs root; if you
+# run the whole thing under sudo it still updates *your* flatpak user install.
+#
+# Usage: sysupdate [options]
+#   -n, --dry-run          show pending updates, install nothing
+#       --noconfirm        answer yes to every prompt (pacman/yay/flatpak)
+#       --no-privileged    skip the root-only section (pacman)
+#       --skip-pacman      skip pacman
+#       --skip-yay         skip yay
+#       --skip-flatpak    skip flatpak
+#   -h, --help             this text
+#
+set -u
+
+DRY_RUN=0
+NOCONFIRM=0
+DO_PRIV=1
+DO_PACMAN=1
+DO_YAY=1
+DO_FLATPAK=1
+LOG_KEEP=20
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run)     DRY_RUN=1 ;;
+    --noconfirm)      NOCONFIRM=1 ;;
+    --no-privileged)  DO_PRIV=0 ;;
+    --skip-pacman)    DO_PACMAN=0 ;;
+    --skip-yay)       DO_YAY=0 ;;
+    --skip-flatpak)   DO_FLATPAK=0 ;;
+    -h|--help)        awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    *) echo "sysupdate: unknown option '$1' (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------- context ---
+# If invoked as root via sudo, target the invoking user's home rather than /root.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+  U="$SUDO_USER"
+  H="$(getent passwd "$U" | cut -d: -f6)"
+  ROOT_RUN=1
+else
+  U="$(id -un)"
+  H="$HOME"
+  ROOT_RUN=0
+fi
+
+XDG_STATE="$H/.local/state"
+LOG_DIR="$XDG_STATE/sysupdate"
+mkdir -p "$LOG_DIR" 2>/dev/null
+LOG="$LOG_DIR/$(date +%Y%m%d-%H%M%S).log"
+
+# Friendly names for the summary.
+note()  { printf '%s\n' "$*"; }
+skip()  { printf '  skip   %s\n' "$*"; }
+ok()    { printf '  ok     %s\n' "$*"; }
+fail()  { printf '  FAILED %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------ privileged ---
+CAN_SUDO=0
+if [ "$(id -u)" -eq 0 ]; then
+  CAN_SUDO=1
+elif [ "$DO_PRIV" -eq 1 ] && command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+  if sudo -v 2>/dev/null; then CAN_SUDO=1; else note "note: sudo declined — skipping root-only sections"; fi
+fi
+priv() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif [ "$CAN_SUDO" -eq 1 ]; then sudo "$@"
+  else return 1; fi
+}
+
+FAILED=0   # Sections that failed; script exits 1 at the end if non-zero.
+RAN=0      # Sections that actually ran.
+
+# Confirm flag passed to the package managers.
+CONFIRM=()
+[ "$NOCONFIRM" -eq 1 ] && CONFIRM=(--noconfirm)
+FLAT_CONFIRM=()
+[ "$NOCONFIRM" -eq 1 ] && FLAT_CONFIRM=(-y)
+
+# ============================================================== main ========
+{
+  note "sysupdate  $(date '+%Y-%m-%d %H:%M')  user=$U  home=$H  dry_run=$DRY_RUN  noconfirm=$NOCONFIRM"
+
+  if [ ! -f /var/lib/pacman/db.lck ]; then
+    : # no lock, fine
+  else
+    note "warning: pacman database is locked (/var/lib/pacman/db.lck exists)"
+    note "         another pacman/yay may be running — check before continuing"
+  fi
+
+  # ------------------------------------------------------------- pacman ---
+  note ""
+  note "== pacman (official repos) =="
+  if [ "$DO_PACMAN" -eq 0 ]; then
+    skip "pacman (--skip-pacman)"
+  elif ! have pacman; then
+    skip "pacman not installed"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    pacman -Qu 2>&1 | head -n 50
+    note "  (dry-run: nothing installed; run without -n to apply)"
+    RAN=$((RAN + 1))
+  elif [ "$DO_PRIV" -eq 0 ] || [ "$CAN_SUDO" -eq 0 ]; then
+    skip "pacman (needs root — re-run without --no-privileged)"
+  else
+    if priv pacman -Syu "${CONFIRM[@]}"; then
+      ok "pacman -Syu"
+    else
+      fail "pacman -Syu"
+      FAILED=$((FAILED + 1))
+    fi
+    RAN=$((RAN + 1))
+  fi
+
+  # ----------------------------------------------------------------- yay ---
+  note ""
+  note "== yay (AUR) =="
+  if [ "$DO_YAY" -eq 0 ]; then
+    skip "yay (--skip-yay)"
+  elif ! have yay; then
+    skip "yay not installed"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    yay -Qu 2>&1 | head -n 50
+    note "  (dry-run: nothing installed; run without -n to apply)"
+    RAN=$((RAN + 1))
+  elif [ "$DO_PRIV" -eq 0 ] || [ "$CAN_SUDO" -eq 0 ]; then
+    skip "yay (needs root for the repo part — re-run without --no-privileged)"
+  else
+    # --sudoloop keeps sudo alive during long AUR builds;
+    # answer no to diff/edit prompts under --noconfirm so it never blocks.
+    yay_args=(-Syu --sudoloop)
+    if [ "$NOCONFIRM" -eq 1 ]; then
+      yay_args+=(--noconfirm --answerdiff None --answeredit None --answerclean None --answerupgrade None)
+    fi
+    if yay "${yay_args[@]}"; then
+      ok "yay -Syu"
+    else
+      fail "yay -Syu"
+      FAILED=$((FAILED + 1))
+    fi
+    RAN=$((RAN + 1))
+  fi
+
+  # ------------------------------------------------------------- flatpak ---
+  note ""
+  note "== flatpak =="
+  if [ "$DO_FLATPAK" -eq 0 ]; then
+    skip "flatpak (--skip-flatpak)"
+  elif ! have flatpak; then
+    skip "flatpak not installed"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    flatpak remote-ls --updates 2>&1 | head -n 50
+    note "  (dry-run: nothing installed; run without -n to apply)"
+    RAN=$((RAN + 1))
+  else
+    # `flatpak update` without --user/--system updates every installation;
+    # system-wide needs root, so go through priv() which is a no-op as root.
+    if priv flatpak update "${FLAT_CONFIRM[@]}"; then
+      ok "flatpak update"
+    else
+      fail "flatpak update"
+      FAILED=$((FAILED + 1))
+    fi
+    RAN=$((RAN + 1))
+  fi
+
+  # --------------------------------------------------------------- report ---
+  note ""
+  note "-------------------------------------------------------------"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    note "dry-run complete — nothing was installed"
+  elif [ "$FAILED" -eq 0 ]; then
+    note "all updates finished successfully"
+  else
+    note "$FAILED section(s) failed — see log above"
+  fi
+
+  orphans="$(pacman -Qtdq 2>/dev/null)"
+  if [ -n "$orphans" ]; then
+    note "info: orphaned packages (review, not removed):"
+    printf '           %s\n' $orphans
+    note "      if you actually use one: sudo pacman -D --asexplicit <pkg>"
+  fi
+
+  pacnew="$(find /etc -name '*.pacnew' 2>/dev/null)"
+  if [ -n "$pacnew" ]; then
+    note "info: config files waiting to be merged (.pacnew):"
+    printf '%s\n' "$pacnew" | sed 's/^/           /'
+  fi
+
+  if [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]; then
+    note "note: a reboot is required (kernel/initramfs update)"
+  fi
+
+  note "log: $LOG"
+  note "-------------------------------------------------------------"
+} 2>&1 | tee "$LOG"
+
+# Keep the log directory bounded, like sysclean.
+ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +$((LOG_KEEP + 1)) | xargs -r rm -f
+
+exit "$FAILED"

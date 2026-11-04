@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+#
+# sysclean — periodic disk cleanup for this machine.
+#
+# Reclaims: pacman package cache, systemd journal, flatpak unused runtimes and
+# app caches, language/tool package caches, the XDG cache directory, and trash.
+#
+# Never touches: documents, browser profiles, game saves, application settings,
+# ~/.hermes (the agent's own toolchain), Steam, or any node_modules unless you
+# pass --deep.
+#
+# Run it as your normal user. It asks for sudo itself when it needs root; if you
+# run the whole thing under sudo it still cleans *your* home, not root's.
+#
+# Usage: sysclean [options]
+#   -n, --dry-run          show what would be removed, remove nothing
+#       --no-privileged    skip the root-only sections (pacman, journal)
+#       --deep             also delete node_modules under ~/dev (npm ci restores)
+#       --all              also clear caches that are expensive to re-download
+#                          (huggingface/torch/pip/ollama model + wheel caches)
+#       --no-trash         leave the trash alone (emptied by default)
+#       --keep-yay-days N  keep yay build dirs newer than N days (default 7)
+#   -h, --help             this text
+#
+set -u
+
+DRY_RUN=0
+DO_PRIV=1
+DEEP=0
+ALL=0
+DO_TRASH=1
+KEEP_YAY_DAYS=7
+LOG_KEEP=20
+JOURNAL_MAX=200M
+# Cache dirs whose contents cost real time/bandwidth to fetch again.
+KEEP_EXPENSIVE=(huggingface torch pip ollama models whisper lm-studio)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run)     DRY_RUN=1 ;;
+    --no-privileged)  DO_PRIV=0 ;;
+    --deep)           DEEP=1 ;;
+    --all)            ALL=1 ;;
+    --no-trash)       DO_TRASH=0 ;;
+    --keep-yay-days)  KEEP_YAY_DAYS="${2:-7}"; shift ;;
+    -h|--help)        awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    *) echo "sysclean: unknown option '$1' (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------- context ---
+# If invoked as root via sudo, target the invoking user's home rather than /root.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+  U="$SUDO_USER"
+  H="$(getent passwd "$U" | cut -d: -f6)"
+  ROOT_RUN=1
+else
+  U="$(id -un)"
+  H="$HOME"
+  ROOT_RUN=0
+fi
+
+CACHE="$H/.cache"
+XDG_STATE="$H/.local/state"
+TRASH="$H/.local/share/Trash"
+LOG_DIR="$XDG_STATE/sysclean"
+mkdir -p "$LOG_DIR" 2>/dev/null
+LOG="$LOG_DIR/$(date +%Y%m%d-%H%M%S).log"
+
+# Tool commands must see the right home when the script runs as root.
+asuser() { if [ "$ROOT_RUN" -eq 1 ]; then env HOME="$H" XDG_CACHE_HOME="$CACHE" "$@"; else "$@"; fi; }
+
+FREED=0
+HANDLED=()          # paths already dealt with by a tool-specific section
+size_mb() { local k; k="$(du -sk "$1" 2>/dev/null | awk 'NR==1{print $1+0}')"; echo $(( ${k:-0} / 1024 )); }
+
+note()  { printf '%s\n' "$*"; }
+skip()  { printf '  skip   %s\n' "$*"; }
+freeing() { printf '  %-7s %6s MB  %s\n' "$1" "$2" "$3"; }
+
+# Deletions are restricted to known cache/trash roots. Anything else is refused,
+# which makes a bad variable or a stray glob harmless.
+rm_rf() {
+  local p="$1" mb
+  case "$p" in
+    "$CACHE"/*|"$CACHE"/.[!.]*|"$H/.var/app/"*/cache/*|"$H/.local/share/pnpm/store"|"$TRASH"/*|/var/cache/pacman/pkg/download-*|"$H"/dev/*/node_modules)
+      ;;
+    *) printf '  refuse %s (outside allowed roots)\n' "$p"; return 1 ;;
+  esac
+  [ -e "$p" ] || return 0
+  mb="$(size_mb "$p")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    freeing "would" "$mb" "$p"
+    FREED=$((FREED + mb))
+    return 0
+  fi
+  rm -rf -- "$p"
+  if [ -e "$p" ]; then
+    printf '  FAILED %s\n' "$p"
+    return 1
+  fi
+  freeing "freed" "$mb" "$p"
+  FREED=$((FREED + mb))
+}
+
+# Caches that must not be cleared while their owner is running.
+GUARD_MOZILLA='firefox|librewolf|zen'
+GUARD_CHROMIUM='chromium|chrome|brave'
+GUARD_IDE='antigravity-ide'
+GUARD_CHAT='vesktop|discord|element'
+guarded() {
+  local pat=""
+  case "$1" in
+    mozilla|librewolf|firefox)          pat="$GUARD_MOZILLA" ;;
+    chromium|google-chrome|BraveSoftware) pat="$GUARD_CHROMIUM" ;;
+    "Antigravity IDE"|Antigravity)      pat="$GUARD_IDE" ;;
+    vesktop|discord|Element)            pat="$GUARD_CHAT" ;;
+    *) return 1 ;;
+  esac
+  pgrep -u "$U" -f "$pat" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------ privileged ---
+CAN_SUDO=0
+if [ "$(id -u)" -eq 0 ]; then
+  CAN_SUDO=1
+elif [ "$DO_PRIV" -eq 1 ] && command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+  if sudo -v 2>/dev/null; then CAN_SUDO=1; else note "note: sudo declined — skipping root-only sections"; fi
+fi
+priv() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif [ "$CAN_SUDO" -eq 1 ]; then sudo "$@"
+  else return 1; fi
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ============================================================== main ========
+{
+  note "sysclean  $(date '+%Y-%m-%d %H:%M')  user=$U  home=$H  dry_run=$DRY_RUN"
+  DF_BEFORE="$(df -k / | awk 'NR==2{print $3}')"
+  note "disk used before: $(df -h / | awk 'NR==2{print $3}')"
+
+  # ---------------------------------------------------- pacman / packages ---
+  note ""
+  note "== package cache (pacman) =="
+  if [ "$DO_PRIV" -eq 1 ] && [ "$CAN_SUDO" -eq 1 ]; then
+    if have paccache; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        priv paccache -d -rk1 2>&1 | tail -2 | sed 's/^/  /'
+      else
+        before="$(priv du -sm /var/cache/pacman/pkg 2>/dev/null | awk '{print $1+0}')"
+        priv paccache -rk1 >/dev/null 2>&1
+        priv paccache -ruk0 >/dev/null 2>&1
+        after="$(priv du -sm /var/cache/pacman/pkg 2>/dev/null | awk '{print $1+0}')"
+        freeing "freed" "$((before - after))" "/var/cache/pacman/pkg (kept 1 version per installed pkg)"
+        FREED=$((FREED + before - after))
+      fi
+    else
+      skip "paccache not installed (pacman-contrib)"
+    fi
+    # Leftovers from interrupted transactions.
+    for d in /var/cache/pacman/pkg/download-*; do
+      [ -e "$d" ] || continue
+      rm_rf "$d"
+    done
+    # Report-only: packages pulled in as dependencies that nothing requires.
+    orphans="$(pacman -Qtdq 2>/dev/null)"
+    if [ -n "$orphans" ]; then
+      note "  info   orphaned packages (review, not removed):"
+      printf '           %s\n' $orphans
+      note "         if you actually use one: sudo pacman -D --asexplicit <pkg>"
+    fi
+  else
+    skip "pacman cache (needs root — re-run without --no-privileged)"
+  fi
+
+  # ------------------------------------------------------------- journal ---
+  note ""
+  note "== systemd journal =="
+  if [ "$DO_PRIV" -eq 1 ] && [ "$CAN_SUDO" -eq 1 ]; then
+    before="$(priv journalctl --disk-usage 2>/dev/null | grep -o '[0-9.]*[KMGT]' | head -1)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      note "  would  vacuum to $JOURNAL_MAX (currently ${before:-?})"
+    else
+      priv journalctl --vacuum-size="$JOURNAL_MAX" >/dev/null 2>&1
+      after="$(priv journalctl --disk-usage 2>/dev/null | grep -o '[0-9.]*[KMGT]' | head -1)"
+      note "  ok     journal ${before:-?} -> ${after:-?}"
+    fi
+  else
+    skip "journal (needs root)"
+  fi
+
+  # ------------------------------------------------------------- flatpak ---
+  note ""
+  note "== flatpak =="
+  if have flatpak; then
+    unused="$(flatpak uninstall --unused --dry-run 2>/dev/null | grep -cE '^\s+[0-9]+\.' || true)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      note "  would  remove unused runtimes (${unused:-0} found)"
+    else
+      out="$(asuser flatpak uninstall --unused -y 2>&1 | tail -1)"
+      note "  ok     unused runtimes: ${out:-nothing to do}"
+      priv flatpak uninstall --unused -y >/dev/null 2>&1 || true
+    fi
+  else
+    skip "flatpak not installed"
+  fi
+
+  # --------------------------------------------------- language tool caches ---
+  note ""
+  note "== language/tool caches =="
+  if have npm; then
+    mb="$(size_mb "$H/.npm")"
+    if [ "$DRY_RUN" -eq 1 ]; then freeing "would" "$mb" "$H/.npm (npm cache)"; FREED=$((FREED+mb))
+    else asuser npm cache clean --force >/dev/null 2>&1; freeing "freed" "$mb" "$H/.npm (npm cache)"; FREED=$((FREED+mb)); fi
+  fi
+  if have bun && [ -d "$CACHE/.bun" ]; then
+    HANDLED+=("$CACHE/.bun")
+    mb="$(size_mb "$CACHE/.bun")"
+    if [ "$DRY_RUN" -eq 1 ]; then freeing "would" "$mb" "$CACHE/.bun"; FREED=$((FREED+mb))
+    else asuser bun pm cache rm >/dev/null 2>&1; rm_rf "$CACHE/.bun"; fi
+  fi
+  if have uv && [ -d "$CACHE/uv" ]; then
+    HANDLED+=("$CACHE/uv")
+    mb="$(size_mb "$CACHE/uv")"
+    if [ "$DRY_RUN" -eq 1 ]; then freeing "would" "$mb" "$CACHE/uv"; FREED=$((FREED+mb))
+    else asuser uv cache clean >/dev/null 2>&1; rm_rf "$CACHE/uv"; fi
+  fi
+  if have pnpm && [ -d "$H/.local/share/pnpm/store" ]; then
+    HANDLED+=("$H/.local/share/pnpm/store")
+    rm_rf "$H/.local/share/pnpm/store"
+  fi
+  # yay keeps a full build tree per AUR package; only stale ones are dropped so
+  # an in-progress build is never disturbed.
+  if [ -d "$CACHE/yay" ]; then
+    for d in "$CACHE/yay"/*/; do
+      [ -d "$d" ] || continue
+      if [ -n "$(find "$d" -maxdepth 0 -mtime +"$KEEP_YAY_DAYS" 2>/dev/null)" ]; then
+        rm_rf "${d%/}"
+      else
+        skip "$(basename "$d") (yay build dir newer than ${KEEP_YAY_DAYS}d)"
+      fi
+    done
+  fi
+
+  # ----------------------------------------------------------- XDG cache ---
+  note ""
+  note "== ~/.cache =="
+  for entry in "$CACHE"/* "$CACHE"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ "$name" = "yay" ] && continue          # handled above, age-based
+    [ "$name" = "sysclean" ] && continue
+    case " ${HANDLED[*]:-} " in
+      *" $entry "*) skip "$name (handled by its own section)"; continue ;;
+    esac
+    # Model weights, wheel caches and the like are caches in name only: clearing
+    # them can mean re-downloading gigabytes. Kept unless --all is given.
+    case " ${KEEP_EXPENSIVE[*]} " in
+      *" $name "*)
+        if [ "$ALL" -eq 1 ]; then :; else
+          skip "$name (expensive to re-download — use --all to clear)"; continue
+        fi ;;
+    esac
+    if guarded "$name"; then skip "$name (owner process is running)"; continue; fi
+    rm_rf "$entry"
+  done
+
+  # --------------------------------------------------- flatpak app caches ---
+  note ""
+  note "== flatpak app caches (~/.var/app/*/cache) =="
+  running="$(flatpak ps --columns=application 2>/dev/null | tail -n +1)"
+  for cdir in "$H"/.var/app/*/cache; do
+    [ -d "$cdir" ] || continue
+    appid="$(basename "$(dirname "$cdir")")"
+    if printf '%s\n' "$running" | grep -qx "$appid"; then
+      skip "$appid (running)"
+      continue
+    fi
+    for sub in "$cdir"/* "$cdir"/.[!.]*; do
+      [ -e "$sub" ] || continue
+      rm_rf "$sub"
+    done
+  done
+
+  # -------------------------------------------------------------- trash ----
+  note ""
+  note "== trash =="
+  if [ "$DO_TRASH" -eq 1 ]; then
+    rm_rf "$TRASH/files"
+    rm_rf "$TRASH/info"
+  else
+    skip "trash (--no-trash)"
+  fi
+
+  # ------------------------------------------------------- optional deep ---
+  if [ "$DEEP" -eq 1 ]; then
+    note ""
+    note "== node_modules under ~/dev (--deep) =="
+    while IFS= read -r nm; do
+      [ -n "$nm" ] || continue
+      rm_rf "$nm"
+    done < <(find "$H/dev" -name node_modules -type d -prune 2>/dev/null)
+  fi
+
+  # ------------------------------------------------------------- report ----
+  note ""
+  DF_AFTER="$(df -k / | awk 'NR==2{print $3}')"
+  note "-------------------------------------------------------------"
+  note "apparent size removed : ${FREED} MB"
+  note "disk used before/after: $(numfmt --to=iec $((DF_BEFORE*1024)) 2>/dev/null || echo "${DF_BEFORE}K") / $(numfmt --to=iec $((DF_AFTER*1024)) 2>/dev/null || echo "${DF_AFTER}K")"
+  note "actually reclaimed    : $(( (DF_BEFORE - DF_AFTER) / 1024 )) MB"
+  note "  (btrfs compresses, so the real reclaim can differ from the apparent sum;"
+  note "   space from deletions may also be released asynchronously)"
+  note "log: $LOG"
+  note "-------------------------------------------------------------"
+} 2>&1 | tee "$LOG"
+
+# Keep the log directory bounded.
+ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +$((LOG_KEEP + 1)) | xargs -r rm -f
+exit 0
