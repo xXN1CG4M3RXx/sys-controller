@@ -6,8 +6,10 @@
 #
 # What "on" does:
 #   1. Writes /etc/systemd/logind.conf.d/server-mode.conf so lid, suspend and
-#      hibernate keys are ignored and idle never triggers a suspend action,
-#      then restarts systemd-logind. Persistent across reboots.
+#      hibernate keys are ignored and idle never triggers a suspend action.
+#      Persistent across reboots; takes effect on the next logind start.
+#      (Restarting logind would kill the graphical session, so this script
+#      deliberately does not do that.)
 #   2. Masks sleep/suspend/hibernate/hybrid-sleep targets so nothing can
 #      suspend the machine, no matter what asks for it.
 #   3. Holds user-session systemd inhibitors for idle/sleep/shutdown/
@@ -58,19 +60,23 @@ on() {
         echo "[dry-run] write $CONF"
     else
         sudo install -d "$CONF_DIR"
-        sudo tee "$CONF" >/dev/null <<'EOF'
-[Login]
-HandleLidSwitch=ignore
-HandleLidSwitchExternalPower=ignore
-HandleLidSwitchDocked=ignore
-HandleSuspendKey=ignore
-HandleHibernateKey=ignore
-HandlePowerKey=ignore
-IdleAction=ignore
-EOF
+        printf '%s\n' \
+            '[Login]' \
+            'HandleLidSwitch=ignore' \
+            'HandleLidSwitchExternalPower=ignore' \
+            'HandleLidSwitchDocked=ignore' \
+            'HandleSuspendKey=ignore' \
+            'HandleHibernateKey=ignore' \
+            'HandlePowerKey=ignore' \
+            'IdleAction=ignore' \
+            | sudo tee "$CONF" >/dev/null
     fi
 
-    run_sudo systemctl restart systemd-logind
+    if [[ $DRY_RUN -eq 0 && ! -s "$CONF" ]]; then
+        echo "ERROR: $CONF is empty — logind override not applied." >&2
+        return 1
+    fi
+
     run_sudo systemctl mask $TARGETS
 
     for daemon in $IDLE_DAEMONS; do
@@ -111,7 +117,6 @@ off() {
     fi
 
     run_sudo rm -f "$CONF"
-    run_sudo systemctl restart systemd-logind
     run_sudo systemctl unmask $TARGETS
 
     echo "server-mode OFF. Normal suspend/lock behaviour restored."
@@ -129,7 +134,7 @@ status() {
 
     for t in $TARGETS; do
         local enabled
-        enabled="$(systemctl is-enabled "$t" 2>/dev/null)"
+        enabled="$(systemctl is-enabled "$t" 2>/dev/null)" || enabled="unknown"
         printf "  %-22s %s\n" "$t" "$enabled"
         if [[ "$enabled" == "masked" ]]; then
             state="ON"
