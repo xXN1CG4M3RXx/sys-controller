@@ -24,6 +24,7 @@
 set -euo pipefail
 
 CONF=/etc/systemd/logind.conf.d/server-mode.conf
+CONF_DIR=/etc/systemd/logind.conf.d
 RUNTIME_PID="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/server-mode.inhibit.pid"
 TARGETS="sleep.target suspend.target hibernate.target hybrid-sleep.target"
 IDLE_DAEMONS="hypridle swayidle"
@@ -56,6 +57,7 @@ on() {
     if [[ $DRY_RUN -eq 1 ]]; then
         echo "[dry-run] write $CONF"
     else
+        sudo install -d "$CONF_DIR"
         sudo tee "$CONF" >/dev/null <<'EOF'
 [Login]
 HandleLidSwitch=ignore
