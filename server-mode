@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# server-mode — put this machine into a server-like state where it never
+# suspends, never hibernates and never locks, so it stays reachable
+# (e.g. over Tailscale/SSH) even when left unattended.
+#
+# What "on" does:
+#   1. Writes /etc/systemd/logind.conf.d/server-mode.conf so lid, suspend and
+#      hibernate keys are ignored and idle never triggers a suspend action,
+#      then restarts systemd-logind. Persistent across reboots.
+#   2. Masks sleep/suspend/hibernate/hybrid-sleep targets so nothing can
+#      suspend the machine, no matter what asks for it.
+#   3. Holds user-session systemd inhibitors for idle/sleep/shutdown/
+#      power-key/lid-switch, so this session keeps the machine awake while
+#      the script's inhibitor process is running.
+#   4. Stops idle daemons that would dim or lock the screen (hypridle,
+#      swayidle) as a belt-and-braces measure.
+#
+# "off" undoes all of it. Run as your normal user; it asks for sudo itself
+# when it needs root. Safe to run repeatedly.
+#
+# Usage: server-mode [on|off|status] [-n|--dry-run]
+
+set -euo pipefail
+
+CONF=/etc/systemd/logind.conf.d/server-mode.conf
+RUNTIME_PID="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/server-mode.inhibit.pid"
+TARGETS="sleep.target suspend.target hibernate.target hybrid-sleep.target"
+IDLE_DAEMONS="hypridle swayidle"
+DRY_RUN=0
+
+cmd="${1:-status}"
+case "${2:-}" in
+    -n|--dry-run) DRY_RUN=1 ;;
+esac
+
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[dry-run] $*"
+        return 0
+    fi
+    "$@"
+}
+
+run_sudo() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[dry-run] sudo $*"
+        return 0
+    fi
+    sudo "$@"
+}
+
+on() {
+    echo "Enabling server-mode…"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[dry-run] write $CONF"
+    else
+        sudo tee "$CONF" >/dev/null <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandlePowerKey=ignore
+IdleAction=ignore
+EOF
+    fi
+
+    run_sudo systemctl restart systemd-logind
+    run_sudo systemctl mask $TARGETS
+
+    for daemon in $IDLE_DAEMONS; do
+        if pgrep -x "$daemon" >/dev/null; then
+            echo "Stopping idle daemon: $daemon"
+            run pkill -x "$daemon" || true
+        fi
+    done
+
+    if [[ -f "$RUNTIME_PID" ]] && kill -0 "$(cat "$RUNTIME_PID")" 2>/dev/null; then
+        echo "Inhibitor already running (pid $(cat "$RUNTIME_PID"))"
+    else
+        run nohup systemd-inhibit \
+            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --why="server-mode" --who="server-mode" \
+            sleep infinity >/dev/null 2>&1 &
+        if [[ $DRY_RUN -eq 0 ]]; then
+            echo $! >"$RUNTIME_PID"
+        fi
+        echo "Holding systemd inhibitors (pid ${DRY_RUN:+dry-run})"
+    fi
+
+    echo "server-mode ON. Machine will stay awake and reachable."
+}
+
+off() {
+    echo "Disabling server-mode…"
+
+    if [[ -f "$RUNTIME_PID" ]]; then
+        pid="$(cat "$RUNTIME_PID")"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Releasing systemd inhibitors (pid $pid)"
+            run kill "$pid"
+        fi
+        run rm -f "$RUNTIME_PID"
+    fi
+
+    run_sudo rm -f "$CONF"
+    run_sudo systemctl restart systemd-logind
+    run_sudo systemctl unmask $TARGETS
+
+    echo "server-mode OFF. Normal suspend/lock behaviour restored."
+}
+
+status() {
+    if [[ -f "$CONF" ]]; then
+        echo "logind override: present ($CONF)"
+    else
+        echo "logind override: absent"
+    fi
+
+    for t in $TARGETS; do
+        printf "  %-22s %s\n" "$t" "$(systemctl is-enabled "$t" 2>/dev/null)"
+    done
+
+    if [[ -f "$RUNTIME_PID" ]] && kill -0 "$(cat "$RUNTIME_PID")" 2>/dev/null; then
+        echo "inhibitor: active (pid $(cat "$RUNTIME_PID"))"
+    else
+        echo "inhibitor: inactive"
+    fi
+}
+
+case "$cmd" in
+    on) on ;;
+    off) off ;;
+    status) status ;;
+    *)
+        echo "Usage: server-mode [on|off|status] [-n|--dry-run]" >&2
+        exit 1
+        ;;
+esac
