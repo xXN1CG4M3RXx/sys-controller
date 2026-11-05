@@ -85,13 +85,15 @@ EOF
             --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
             --why="server-mode" --who="server-mode" \
             sleep infinity >/dev/null 2>&1 &
-        if [[ $DRY_RUN -eq 0 ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "Holding systemd inhibitors (dry-run)"
+        else
             echo $! >"$RUNTIME_PID"
+            echo "Holding systemd inhibitors (pid $!)"
         fi
-        echo "Holding systemd inhibitors (pid ${DRY_RUN:+dry-run})"
     fi
 
-    echo "server-mode ON. Machine will stay awake and reachable."
+    echo "Server Mode: ON. Machine will stay awake and reachable."
 }
 
 off() {
@@ -114,20 +116,35 @@ off() {
 }
 
 status() {
+    local state="OFF"
+
     if [[ -f "$CONF" ]]; then
         echo "logind override: present ($CONF)"
+        state="ON"
     else
         echo "logind override: absent"
     fi
 
     for t in $TARGETS; do
-        printf "  %-22s %s\n" "$t" "$(systemctl is-enabled "$t" 2>/dev/null)"
+        local enabled
+        enabled="$(systemctl is-enabled "$t" 2>/dev/null)"
+        printf "  %-22s %s\n" "$t" "$enabled"
+        if [[ "$enabled" == "masked" ]]; then
+            state="ON"
+        fi
     done
 
     if [[ -f "$RUNTIME_PID" ]] && kill -0 "$(cat "$RUNTIME_PID")" 2>/dev/null; then
         echo "inhibitor: active (pid $(cat "$RUNTIME_PID"))"
+        state="ON"
     else
         echo "inhibitor: inactive"
+    fi
+
+    echo
+    echo "Server Mode: $state"
+    if [[ "$state" == "OFF" ]]; then
+        echo "Run 'server-mode on' to enable it."
     fi
 }
 
