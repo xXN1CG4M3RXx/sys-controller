@@ -134,7 +134,10 @@ status() {
 
     for t in $TARGETS; do
         local enabled
-        enabled="$(systemctl is-enabled "$t" 2>/dev/null)" || enabled="unknown"
+        enabled="$(systemctl is-enabled "$t" 2>/dev/null)" || true
+        if [[ -z "$enabled" ]]; then
+            enabled="unknown"
+        fi
         printf "  %-22s %s\n" "$t" "$enabled"
         if [[ "$enabled" == "masked" ]]; then
             state="ON"
