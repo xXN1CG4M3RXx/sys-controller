@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#
+# restore-usb-mic-gain - raise the hardware capture gain on USB headsets.
+#
+# Why this exists: USB audio devices reset their own mixer when they
+# re-enumerate, and alsa-restore.service re-applies /var/lib/alsa/asound.state
+# at every boot. When either of those holds a low capture gain, the headset mic
+# sits near -74 dB and looks "dead" until something raises it again - the
+# PipeWire node volume is already at 100% and nothing is muted, so it looks
+# like a software bug but is really just the hardware ADC gain.
+#
+# Runs from usb-mic-gain.service at login and from usb-mic-gain.timer every
+# 60s, so hot-plugging the dongle is covered too.
+#
+# Remove together with ~/.config/systemd/user/usb-mic-gain.service and
+# ~/.config/systemd/user/usb-mic-gain.timer
+
+set -u
+
+CARD=Headset   # ALSA card id of the Logitech G733 dongle
+
+# Nothing to do when the dongle is not plugged in.
+amixer -c "$CARD" sget 'Mic' >/dev/null 2>&1 || exit 0
+
+# It can take a moment to become ready after hot-plug.
+for _ in 1 2 3; do
+    amixer -c "$CARD" sset 'Mic' 100% >/dev/null 2>&1 && exit 0
+    sleep 1
+done
+
+exit 0
