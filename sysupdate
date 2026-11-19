@@ -5,7 +5,10 @@
 # Runs, in order:
 #   1. pacman -Syu            (official repos)
 #   2. yay -Syu               (AUR packages; re-checks repos, usually a no-op there)
-#   3. flatpak update         (user + system installations)
+#   3. snap refresh           (snap packages; skipped if snap isn't installed)
+#   4. flatpak update         (user + system installations; -y always, since the
+#                              script's own log pipe hides prompts from flatpak)
+#   5. optional:               remove orphaned packages (with -c/--clean-orphans)
 #
 # Then reports orphaned packages and .pacnew files, like sysclean does.
 #
@@ -14,31 +17,37 @@
 #
 # Usage: sysupdate [options]
 #   -n, --dry-run          show pending updates, install nothing
-#       --noconfirm        answer yes to every prompt (pacman/yay/flatpak)
-#       --no-privileged    skip the root-only section (pacman)
+#   -c, --clean-orphans    also remove orphaned packages (pacman -Rns)
+#       --noconfirm        answer yes to every prompt (pacman/yay)
+#       --no-privileged    skip the root-only sections (pacman/snap/flatpak)
 #       --skip-pacman      skip pacman
 #       --skip-yay         skip yay
+#       --skip-snap        skip snap
 #       --skip-flatpak    skip flatpak
 #   -h, --help             this text
 #
 set -u
 
 DRY_RUN=0
+CLEAN_ORPHANS=0
 NOCONFIRM=0
 DO_PRIV=1
 DO_PACMAN=1
 DO_YAY=1
+DO_SNAP=1
 DO_FLATPAK=1
 LOG_KEEP=20
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -n|--dry-run)     DRY_RUN=1 ;;
-    --noconfirm)      NOCONFIRM=1 ;;
-    --no-privileged)  DO_PRIV=0 ;;
-    --skip-pacman)    DO_PACMAN=0 ;;
-    --skip-yay)       DO_YAY=0 ;;
-    --skip-flatpak)   DO_FLATPAK=0 ;;
+    -n|--dry-run)       DRY_RUN=1 ;;
+    -c|--clean-orphans) CLEAN_ORPHANS=1 ;;
+    --noconfirm)        NOCONFIRM=1 ;;
+    --no-privileged)    DO_PRIV=0 ;;
+    --skip-pacman)      DO_PACMAN=0 ;;
+    --skip-yay)         DO_YAY=0 ;;
+    --skip-snap)        DO_SNAP=0 ;;
+    --skip-flatpak)     DO_FLATPAK=0 ;;
     -h|--help)        awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "sysupdate: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
@@ -89,8 +98,6 @@ RAN=0      # Sections that actually ran.
 # Confirm flag passed to the package managers.
 CONFIRM=()
 [ "$NOCONFIRM" -eq 1 ] && CONFIRM=(--noconfirm)
-FLAT_CONFIRM=()
-[ "$NOCONFIRM" -eq 1 ] && FLAT_CONFIRM=(-y)
 
 # ============================================================== main ========
 {
@@ -169,11 +176,70 @@ FLAT_CONFIRM=()
   else
     # `flatpak update` without --user/--system updates every installation;
     # system-wide needs root, so go through priv() which is a no-op as root.
-    if priv flatpak update "${FLAT_CONFIRM[@]}"; then
+    # Always -y/--assumeyes: this script's log pipeline is a pipe, not a tty, so
+    # without it flatpak would answer "n" at its prompts and abort (e.g. when an
+    # app needs a missing runtime — the failure you hit last run).
+    if priv flatpak update -y; then
       ok "flatpak update"
     else
       fail "flatpak update"
       FAILED=$((FAILED + 1))
+    fi
+    RAN=$((RAN + 1))
+  fi
+
+  # ----------------------------------------------------------------- snap ---
+  note ""
+  note "== snap =="
+  if [ "$DO_SNAP" -eq 0 ]; then
+    skip "snap (--skip-snap)"
+  elif ! have snap; then
+    skip "snap not installed"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    snap refresh --list 2>&1 | head -n 30
+    note "  (dry-run: nothing installed; run without -n to apply)"
+    RAN=$((RAN + 1))
+  elif [ "$DO_PRIV" -eq 0 ] || [ "$CAN_SUDO" -eq 0 ]; then
+    skip "snap (needs root — re-run without --no-privileged)"
+  else
+    if priv snap refresh; then
+      ok "snap refresh"
+    else
+      fail "snap refresh"
+      FAILED=$((FAILED + 1))
+    fi
+    RAN=$((RAN + 1))
+  fi
+
+  # -------------------------------------------------- orphaned packages ---
+  note ""
+  note "== orphaned packages =="
+  if [ "$CLEAN_ORPHANS" -eq 0 ]; then
+    skip "orphans (--clean-orphans not given; review only)"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    orphans="$(pacman -Qtdq 2>/dev/null)"
+    if [ -n "$orphans" ]; then
+      note "  would  remove orphaned packages:"
+      printf '           %s\n' $orphans
+    else
+      note "  ok     no orphaned packages"
+    fi
+    RAN=$((RAN + 1))
+  elif [ "$DO_PRIV" -eq 0 ] || [ "$CAN_SUDO" -eq 0 ]; then
+    skip "orphans (needs root — re-run without --no-privileged)"
+  else
+    orphans="$(pacman -Qtdq 2>/dev/null)"
+    if [ -n "$orphans" ]; then
+      # --noconfirm: orphan removal is the explicit -c action; under the log
+      # pipe pacman can't reliably prompt, and defaulting could block or hang.
+      if priv pacman -Rns --noconfirm $orphans 2>&1; then
+        ok "removed orphaned packages: $orphans"
+      else
+        fail "orphan removal ($orphans)"
+        FAILED=$((FAILED + 1))
+      fi
+    else
+      ok "no orphaned packages"
     fi
     RAN=$((RAN + 1))
   fi
